@@ -1,0 +1,226 @@
+import { Feather } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
+import React, { useMemo, useState } from "react";
+import { Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useQueryClient } from "@tanstack/react-query";
+import { router } from "expo-router";
+
+import {
+  useListTasks,
+  useUpdateTask,
+  getListTasksQueryKey,
+  useListWorkItems,
+  getListWorkItemsQueryKey,
+  Task,
+} from "@workspace/api-client-react";
+
+import { EmptyState } from "@/components/EmptyState";
+import { TaskCard } from "@/components/TaskCard";
+import { useAppAuth } from "@/context/AuthContext";
+import { useOffline } from "@/context/OfflineContext";
+import { useOfflineCache } from "@/hooks/useOfflineCache";
+import { useColors } from "@/hooks/useColors";
+import { usePermissions } from "@/lib/permissions";
+import { TaskFormSheet } from "./TaskFormSheet";
+
+type FilterStatus = "todo" | "in_progress" | "done" | "all";
+const STATUS_FILTERS: { label: string; value: FilterStatus }[] = [
+  { label: "Open", value: "todo" },
+  { label: "In Progress", value: "in_progress" },
+  { label: "Done", value: "done" },
+  { label: "All", value: "all" },
+];
+
+interface Props {
+  mineOnly: boolean;
+}
+
+export function TasksView({ mineOnly }: Props) {
+  const colors = useColors();
+  const insets = useSafeAreaInsets();
+  const { currentMember } = useAppAuth();
+  const { isOnline } = useOffline();
+  const { canDo } = usePermissions();
+  const queryClient = useQueryClient();
+
+  const [filterStatus, setFilterStatus] = useState<FilterStatus>("todo");
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [updatingTaskId, setUpdatingTaskId] = useState<number | null>(null);
+  const { mutateAsync: updateTask } = useUpdateTask();
+
+  const queryParams = {
+    ...(filterStatus !== "all" ? { status: filterStatus } : {}),
+    ...(mineOnly && currentMember ? { assigneeId: currentMember.id } : {}),
+  };
+
+  const { data: liveTasks, isLoading, refetch } = useListTasks(queryParams);
+  const tasks = useOfflineCache("tasks", liveTasks, !isOnline);
+
+  const serviceParams = {
+    kind: "service_job",
+    ...(mineOnly && currentMember ? { assigneeId: currentMember.id } : {}),
+  };
+  const { data: liveServiceJobs, refetch: refetchServiceJobs } = useListWorkItems(
+    serviceParams,
+    { query: { queryKey: getListWorkItemsQueryKey(serviceParams) } },
+  );
+  const serviceJobs = useOfflineCache("tasks_service_jobs", liveServiceJobs, !isOnline);
+
+  const serviceItems = useMemo(() => {
+    return (serviceJobs ?? [])
+      .map((j) => ({
+        id: j.id,
+        title: j.summary ?? `Job #${j.id}`,
+        bucket: serviceStatusBucket(j.status),
+        priority: j.priority ?? null,
+        dueDate: j.dueAt ?? j.scheduledWindowStart ?? null,
+        customerName: j.customerName ?? null,
+      }))
+      .filter((it) => filterStatus === "all" || it.bucket === filterStatus);
+  }, [serviceJobs, filterStatus]);
+
+  const isRefreshEnabled = isOnline;
+
+  return (
+    <>
+      <View style={{ height: 48, marginBottom: 16 }}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          style={styles.pillScroll}
+          contentContainerStyle={styles.pillRow}
+        >
+          {STATUS_FILTERS.map((f) => (
+            <Pressable
+              key={f.value}
+              style={[
+                styles.pill,
+                {
+                  borderColor: colors.border,
+                  backgroundColor: filterStatus === f.value ? colors.primary : colors.card,
+                },
+              ]}
+              onPress={() => setFilterStatus(f.value)}
+            >
+              <Text
+                style={[
+                  styles.pillText,
+                  { color: filterStatus === f.value ? "#fff" : colors.mutedForeground },
+                ]}
+              >
+                {f.label}
+              </Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      </View>
+
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingBottom: insets.bottom + 100 }}
+        refreshControl={
+          <RefreshControl
+            refreshing={false}
+            onRefresh={() => {
+              refetch();
+              refetchServiceJobs();
+            }}
+            tintColor={colors.primary}
+          />
+        }
+      >
+        {isLoading && !tasks ? (
+          <Text style={[styles.loading, { color: colors.mutedForeground }]}>Loading…</Text>
+        ) : !tasks?.length && !serviceItems.length ? (
+          <EmptyState
+            icon="check-circle"
+            title="No tasks found"
+            subtitle={
+              filterStatus === "done"
+                ? "Complete some tasks to see them here"
+                : "Nothing open right now"
+            }
+          />
+        ) : (
+          <View style={styles.list}>
+            {tasks?.map((task) => (
+              <TaskCard
+                key={`task-${task.id}`}
+                title={task.title}
+                status={task.status}
+                priority={task.priority}
+                dueDate={task.dueDate ?? null}
+                projectName={task.projectName}
+                visibility={task.visibility}
+                sharedMemberCount={task.sharedMemberIds?.length ?? 0}
+                isUpdating={updatingTaskId === task.id}
+                onPress={
+                  canDo("tasks.edit")
+                    ? () => {
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                        setEditingTask(task);
+                      }
+                    : undefined
+                }
+              />
+            ))}
+            {serviceItems.map((job) => (
+              <TaskCard
+                key={`service-${job.id}`}
+                title={job.title}
+                status={job.bucket}
+                priority={job.priority}
+                dueDate={job.dueDate}
+                projectName={job.customerName ? `Service · ${job.customerName}` : "Service job"}
+                onPress={() => {
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  router.push(`/service/${job.id}` as never);
+                }}
+              />
+            ))}
+          </View>
+        )}
+      </ScrollView>
+
+      <StatusPickerModal
+
+        visible={!!statusPickerTask}
+        title="Update Task Status"
+        itemTitle={statusPickerTask?.title}
+        currentStatus={statusPickerTask?.status}
+        options={[
+          { value: "todo", label: "To Do", dotColor: "#9ca3af" },
+          { value: "in_progress", label: "In Progress", dotColor: "#1d4ed8" },
+          { value: "done", label: "Done", dotColor: "#16a34a" },
+        ]}
+        onClose={() => setStatusPickerTask(null)}
+        onSelect={(s) => {
+          if (statusPickerTask) changeStatus(statusPickerTask.id, s);
+        }}
+      />
+    </>
+  );
+}
+
+function serviceStatusBucket(status: string): FilterStatus {
+  if (status === "completed" || status === "cancelled") return "done";
+  if (status === "en_route" || status === "on_site" || status === "in_progress") {
+    return "in_progress";
+  }
+  return "todo";
+}
+
+const styles = StyleSheet.create({
+  pillScroll: { marginBottom: 20, flexGrow: 0 },
+  pillRow: { paddingHorizontal: 20, gap: 8, flexDirection: "row" },
+  pill: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1.5,
+  },
+  pillText: { fontSize: 13, fontFamily: "Inter_600SemiBold" },
+  list: { gap: 0, paddingHorizontal: 0 },
+  loading: { paddingHorizontal: 20, fontSize: 15, fontFamily: "Inter_400Regular" },
+});
