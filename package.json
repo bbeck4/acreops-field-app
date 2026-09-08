@@ -17,9 +17,6 @@
     "typescript": "~5.9.2"
   },
   "pnpm": {
-    "patchedDependencies": {
-      "metro@0.84.5": "patches/metro@0.84.5.patch"
-    },
     "overrides": {
       "metro@0.83.3": "0.83.8",
       "image-size@<2.0.2": "2.0.2",
